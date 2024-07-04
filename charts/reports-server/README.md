@@ -42,8 +42,8 @@ helm install reports-server --namespace reports-server --create-namespace report
 | podAnnotations | object | `{}` | Pod annotations |
 | podSecurityContext | object | `{"fsGroup":2000}` | Pod security context |
 | securityContext | object | See [values.yaml](values.yaml) | Container security context |
-| livenessProbe | object | `{"failureThreshold":3,"httpGet":{"path":"/livez","port":"https","scheme":"HTTPS"},"periodSeconds":10}` | Liveness probe |
-| readinessProbe | object | `{"failureThreshold":3,"httpGet":{"path":"/readyz","port":"https","scheme":"HTTPS"},"initialDelaySeconds":20,"periodSeconds":10}` | Readiness probe |
+| livenessProbe | object | `{"failureThreshold":3,"httpGet":{"path":"/livez","port":"https","scheme":"HTTPS"},"initialDelaySeconds":90,"periodSeconds":10}` | Liveness probe |
+| readinessProbe | object | `{"failureThreshold":3,"httpGet":{"path":"/readyz","port":"https","scheme":"HTTPS"},"initialDelaySeconds":100,"periodSeconds":10}` | Readiness probe |
 | resources.limits | string | `nil` | Container resource limits |
 | resources.requests | string | `nil` | Container resource requests |
 | autoscaling.enabled | bool | `false` | Enable autoscaling |
@@ -66,6 +66,10 @@ helm install reports-server --namespace reports-server --create-namespace report
 | config.db.userSecretKeyName | string | `"username"` | The database username will be read from this `key` in the specified Secret, when `db.secretName` is set. |
 | config.db.password | string | `"reports"` | Database password |
 | config.db.passwordSecretKeyName | string | `"password"` | The database password will be read from this `key` in the specified Secret, when `db.secretName` is set. |
+| config.db.sslmode | string | `"disable"` | Database SSL |
+| config.db.sslrootcert | string | `""` | Database SSL root cert |
+| config.db.sslkey | string | `""` | Database SSL key |
+| config.db.sslcert | string | `""` | Database SSL cert |
 
 ## Source Code
 

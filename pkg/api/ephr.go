@@ -8,6 +8,7 @@ import (
 
 	reportsv1 "github.com/kyverno/kyverno/api/reports/v1"
 	"github.com/kyverno/reports-server/pkg/storage"
+	"github.com/kyverno/reports-server/pkg/utils"
 	errorpkg "github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
@@ -52,7 +53,7 @@ func (p *ephrStore) NewList() runtime.Object {
 }
 
 func (p *ephrStore) List(ctx context.Context, options *metainternalversion.ListOptions) (runtime.Object, error) {
-	labelSelector := labels.Everything()
+	var labelSelector labels.Selector
 	// fieldSelector := fields.Everything() // TODO: Field selectors
 	if options != nil {
 		if options.LabelSelector != nil {
@@ -75,17 +76,33 @@ func (p *ephrStore) List(ctx context.Context, options *metainternalversion.ListO
 	// }
 
 	ephrList := &reportsv1.EphemeralReportList{
-		Items: make([]reportsv1.EphemeralReport, 0),
+		Items:    make([]reportsv1.EphemeralReport, 0),
+		ListMeta: metav1.ListMeta{},
 	}
-	for _, ephr := range list.Items {
-		if ephr.Labels == nil {
-			return list, nil
+	var desiredRv uint64
+	if len(options.ResourceVersion) == 0 {
+		desiredRv = 1
+	} else {
+		desiredRv, err = strconv.ParseUint(options.ResourceVersion, 10, 64)
+		if err != nil {
+			return nil, err
 		}
-		if labelSelector.Matches(labels.Set(ephr.Labels)) {
+	}
+	var resourceVersion uint64
+	resourceVersion = 1
+	for _, ephr := range list.Items {
+		allow, rv, err := allowObjectListWatch(ephr.ObjectMeta, labelSelector, desiredRv, options.ResourceVersionMatch)
+		if err != nil {
+			return nil, err
+		}
+		if rv > resourceVersion {
+			resourceVersion = rv
+		}
+		if allow {
 			ephrList.Items = append(ephrList.Items, ephr)
 		}
 	}
-
+	ephrList.ListMeta.ResourceVersion = strconv.FormatUint(resourceVersion, 10)
 	return ephrList, nil
 }
 
@@ -95,7 +112,7 @@ func (p *ephrStore) Get(ctx context.Context, name string, options *metav1.GetOpt
 	klog.Infof("getting ephemeral reports name=%s namespace=%s", name, namespace)
 	report, err := p.getEphr(name, namespace)
 	if err != nil || report == nil {
-		return nil, errors.NewNotFound(reportsv1.Resource("ephemeralreports"), name)
+		return nil, errors.NewNotFound(utils.EphemeralReportsGR, name)
 	}
 	return report, nil
 }
@@ -121,6 +138,12 @@ func (p *ephrStore) Create(ctx context.Context, obj runtime.Object, createValida
 	if !ok {
 		return nil, errors.NewBadRequest("failed to validate ephemeral report")
 	}
+	if ephr.Name == "" {
+		if ephr.GenerateName == "" {
+			return nil, errors.NewConflict(utils.EphemeralReportsGR, ephr.Name, fmt.Errorf("name and generate name not provided"))
+		}
+		ephr.Name = nameGenerator.GenerateName(ephr.GenerateName)
+	}
 
 	namespace := genericapirequest.NamespaceValue(ctx)
 
@@ -128,13 +151,15 @@ func (p *ephrStore) Create(ctx context.Context, obj runtime.Object, createValida
 		ephr.Namespace = namespace
 	}
 
+	ephr.Annotations = labelReports(ephr.Annotations)
+	ephr.Generation = 1
 	klog.Infof("creating ephemeral reports name=%s namespace=%s", ephr.Name, ephr.Namespace)
 	if !isDryRun {
-		err := p.createEphr(ephr)
+		r, err := p.createEphr(ephr)
 		if err != nil {
 			return nil, errors.NewBadRequest(fmt.Sprintf("cannot create ephemeral report: %s", err.Error()))
 		}
-		if err := p.broadcaster.Action(watch.Added, obj); err != nil {
+		if err := p.broadcaster.Action(watch.Added, r); err != nil {
 			klog.ErrorS(err, "failed to broadcast event")
 		}
 	}
@@ -146,28 +171,28 @@ func (p *ephrStore) Update(ctx context.Context, name string, objInfo rest.Update
 	isDryRun := slices.Contains(options.DryRun, "All")
 	namespace := genericapirequest.NamespaceValue(ctx)
 
+	oldObj, err := p.getEphr(name, namespace)
+	if err != nil && !forceAllowCreate {
+		return nil, false, err
+	}
+
+	updatedObject, err := objInfo.UpdatedObject(ctx, oldObj)
+	if err != nil && !forceAllowCreate {
+		return nil, false, err
+	}
+	ephr := updatedObject.(*reportsv1.EphemeralReport)
+
 	if forceAllowCreate {
-		oldObj, _ := p.getEphr(name, namespace)
-		updatedObject, _ := objInfo.UpdatedObject(ctx, oldObj)
-		ephr := updatedObject.(*reportsv1.EphemeralReport)
-		if err := p.updateEphr(ephr, true); err != nil {
+		r, err := p.updateEphr(ephr, oldObj)
+		if err != nil {
 			klog.ErrorS(err, "failed to update resource")
 		}
-		if err := p.broadcaster.Action(watch.Added, updatedObject); err != nil {
+		if err := p.broadcaster.Action(watch.Modified, r); err != nil {
 			klog.ErrorS(err, "failed to broadcast event")
 		}
 		return updatedObject, true, nil
 	}
 
-	oldObj, err := p.getEphr(name, namespace)
-	if err != nil {
-		return nil, false, err
-	}
-
-	updatedObject, err := objInfo.UpdatedObject(ctx, oldObj)
-	if err != nil {
-		return nil, false, err
-	}
 	err = updateValidation(ctx, updatedObject, oldObj)
 	if err != nil {
 		switch options.FieldValidation {
@@ -191,13 +216,15 @@ func (p *ephrStore) Update(ctx context.Context, name string, objInfo rest.Update
 		ephr.Namespace = namespace
 	}
 
+	ephr.Annotations = labelReports(ephr.Annotations)
+	ephr.Generation += 1
 	klog.Infof("updating ephemeral reports name=%s namespace=%s", ephr.Name, ephr.Namespace)
 	if !isDryRun {
-		err := p.updateEphr(ephr, false)
+		r, err := p.updateEphr(ephr, oldObj)
 		if err != nil {
 			return nil, false, errors.NewBadRequest(fmt.Sprintf("cannot create ephemeral report: %s", err.Error()))
 		}
-		if err := p.broadcaster.Action(watch.Modified, updatedObject); err != nil {
+		if err := p.broadcaster.Action(watch.Modified, r); err != nil {
 			klog.ErrorS(err, "failed to broadcast event")
 		}
 	}
@@ -212,7 +239,7 @@ func (p *ephrStore) Delete(ctx context.Context, name string, deleteValidation re
 	ephr, err := p.getEphr(name, namespace)
 	if err != nil {
 		klog.ErrorS(err, "Failed to find ephrs", "name", name, "namespace", klog.KRef("", namespace))
-		return nil, false, errors.NewNotFound(reportsv1.Resource("ephemeralreports"), name)
+		return nil, false, errors.NewNotFound(utils.EphemeralReportsGR, name)
 	}
 
 	err = deleteValidation(ctx, ephr)
@@ -254,21 +281,47 @@ func (p *ephrStore) DeleteCollection(ctx context.Context, deleteValidation rest.
 
 	if !isDryRun {
 		for _, ephr := range ephrList.Items {
-			obj, isDeleted, err := p.Delete(ctx, ephr.GetName(), deleteValidation, options)
+			_, isDeleted, err := p.Delete(ctx, ephr.GetName(), deleteValidation, options)
 			if !isDeleted {
 				klog.ErrorS(err, "Failed to delete ephr", "name", ephr.GetName(), "namespace", klog.KRef("", namespace))
 				return nil, errors.NewBadRequest(fmt.Sprintf("Failed to delete ephemeral report: %s/%s", ephr.Namespace, ephr.GetName()))
-			}
-			if err := p.broadcaster.Action(watch.Deleted, obj); err != nil {
-				klog.ErrorS(err, "failed to broadcast event")
 			}
 		}
 	}
 	return ephrList, nil
 }
 
-func (p *ephrStore) Watch(ctx context.Context, _ *metainternalversion.ListOptions) (watch.Interface, error) {
-	return p.broadcaster.Watch()
+func (p *ephrStore) Watch(ctx context.Context, options *metainternalversion.ListOptions) (watch.Interface, error) {
+	switch options.ResourceVersion {
+	case "", "0":
+		return p.broadcaster.Watch()
+	default:
+		break
+	}
+	items, err := p.List(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	list, ok := items.(*reportsv1.EphemeralReportList)
+	if !ok {
+		return nil, fmt.Errorf("failed to convert runtime object into ephemeral report list")
+	}
+	events := make([]watch.Event, len(list.Items))
+	for i, pol := range list.Items {
+		report := pol.DeepCopy()
+		if report.Generation == 1 || report.Generation == 0 {
+			events[i] = watch.Event{
+				Type:   watch.Added,
+				Object: report,
+			}
+		} else {
+			events[i] = watch.Event{
+				Type:   watch.Modified,
+				Object: report,
+			}
+		}
+	}
+	return p.broadcaster.WatchWithPrefix(events)
 }
 
 func (p *ephrStore) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1beta1.Table, error) {
@@ -325,31 +378,17 @@ func (p *ephrStore) listEphr(namespace string) (*reportsv1.EphemeralReportList, 
 	return reportList, nil
 }
 
-func (p *ephrStore) createEphr(report *reportsv1.EphemeralReport) error {
-	report.ResourceVersion = fmt.Sprint(1)
+func (p *ephrStore) createEphr(report *reportsv1.EphemeralReport) (*reportsv1.EphemeralReport, error) {
+	report.ResourceVersion = p.store.UseResourceVersion()
 	report.UID = uuid.NewUUID()
 	report.CreationTimestamp = metav1.Now()
 
-	return p.store.EphemeralReports().Create(context.TODO(), *report)
+	return report, p.store.EphemeralReports().Create(context.TODO(), *report)
 }
 
-func (p *ephrStore) updateEphr(report *reportsv1.EphemeralReport, force bool) error {
-	if !force {
-		oldReport, err := p.getEphr(report.GetName(), report.Namespace)
-		if err != nil {
-			return errorpkg.Wrapf(err, "old ephemeral report not found")
-		}
-		oldRV, err := strconv.ParseInt(oldReport.ResourceVersion, 10, 64)
-		if err != nil {
-			return errorpkg.Wrapf(err, "could not parse resource version")
-		}
-
-		report.ResourceVersion = fmt.Sprint(oldRV + 1)
-	} else {
-		report.ResourceVersion = "1"
-	}
-
-	return p.store.EphemeralReports().Update(context.TODO(), *report)
+func (p *ephrStore) updateEphr(report *reportsv1.EphemeralReport, _ *reportsv1.EphemeralReport) (*reportsv1.EphemeralReport, error) {
+	report.ResourceVersion = p.store.UseResourceVersion()
+	return report, p.store.EphemeralReports().Update(context.TODO(), *report)
 }
 
 func (p *ephrStore) deleteEphr(report *reportsv1.EphemeralReport) error {

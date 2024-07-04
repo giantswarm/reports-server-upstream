@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/kyverno/reports-server/pkg/storage"
+	"github.com/kyverno/reports-server/pkg/utils"
 	errorpkg "github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
@@ -52,7 +53,7 @@ func (p *polrStore) NewList() runtime.Object {
 }
 
 func (p *polrStore) List(ctx context.Context, options *metainternalversion.ListOptions) (runtime.Object, error) {
-	labelSelector := labels.Everything()
+	var labelSelector labels.Selector
 	// fieldSelector := fields.Everything() // TODO: Field selectors
 	if options != nil {
 		if options.LabelSelector != nil {
@@ -75,17 +76,33 @@ func (p *polrStore) List(ctx context.Context, options *metainternalversion.ListO
 	// }
 
 	polrList := &v1alpha2.PolicyReportList{
-		Items: make([]v1alpha2.PolicyReport, 0),
+		Items:    make([]v1alpha2.PolicyReport, 0),
+		ListMeta: metav1.ListMeta{},
 	}
-	for _, polr := range list.Items {
-		if polr.Labels == nil {
-			return list, nil
+	var desiredRv uint64
+	if len(options.ResourceVersion) == 0 {
+		desiredRv = 1
+	} else {
+		desiredRv, err = strconv.ParseUint(options.ResourceVersion, 10, 64)
+		if err != nil {
+			return nil, err
 		}
-		if labelSelector.Matches(labels.Set(polr.Labels)) {
+	}
+	var resourceVersion uint64
+	resourceVersion = 1
+	for _, polr := range list.Items {
+		allow, rv, err := allowObjectListWatch(polr.ObjectMeta, labelSelector, desiredRv, options.ResourceVersionMatch)
+		if err != nil {
+			return nil, err
+		}
+		if rv > resourceVersion {
+			resourceVersion = rv
+		}
+		if allow {
 			polrList.Items = append(polrList.Items, polr)
 		}
 	}
-
+	polrList.ListMeta.ResourceVersion = strconv.FormatUint(resourceVersion, 10)
 	return polrList, nil
 }
 
@@ -95,7 +112,7 @@ func (p *polrStore) Get(ctx context.Context, name string, options *metav1.GetOpt
 	klog.Infof("getting policy reports name=%s namespace=%s", name, namespace)
 	report, err := p.getPolr(name, namespace)
 	if err != nil || report == nil {
-		return nil, errors.NewNotFound(v1alpha2.Resource("policyreports"), name)
+		return nil, errors.NewNotFound(utils.PolicyReportsGR, name)
 	}
 	return report, nil
 }
@@ -127,14 +144,22 @@ func (p *polrStore) Create(ctx context.Context, obj runtime.Object, createValida
 	if len(polr.Namespace) == 0 {
 		polr.Namespace = namespace
 	}
+	if polr.Name == "" {
+		if polr.GenerateName == "" {
+			return nil, errors.NewConflict(utils.PolicyReportsGR, polr.Name, fmt.Errorf("name and generate name not provided"))
+		}
+		polr.Name = nameGenerator.GenerateName(polr.GenerateName)
+	}
 
+	polr.Annotations = labelReports(polr.Annotations)
+	polr.Generation = 1
 	klog.Infof("creating policy reports name=%s namespace=%s", polr.Name, polr.Namespace)
 	if !isDryRun {
-		err := p.createPolr(polr)
+		r, err := p.createPolr(polr)
 		if err != nil {
 			return nil, errors.NewBadRequest(fmt.Sprintf("cannot create policy report: %s", err.Error()))
 		}
-		if err := p.broadcaster.Action(watch.Added, obj); err != nil {
+		if err := p.broadcaster.Action(watch.Added, r); err != nil {
 			klog.ErrorS(err, "failed to broadcast event")
 		}
 	}
@@ -146,28 +171,28 @@ func (p *polrStore) Update(ctx context.Context, name string, objInfo rest.Update
 	isDryRun := slices.Contains(options.DryRun, "All")
 	namespace := genericapirequest.NamespaceValue(ctx)
 
+	oldObj, err := p.getPolr(name, namespace)
+	if err != nil && !forceAllowCreate {
+		return nil, false, err
+	}
+
+	updatedObject, err := objInfo.UpdatedObject(ctx, oldObj)
+	if err != nil && !forceAllowCreate {
+		return nil, false, err
+	}
+	polr := updatedObject.(*v1alpha2.PolicyReport)
+
 	if forceAllowCreate {
-		oldObj, _ := p.getPolr(name, namespace)
-		updatedObject, _ := objInfo.UpdatedObject(ctx, oldObj)
-		polr := updatedObject.(*v1alpha2.PolicyReport)
-		if err := p.updatePolr(polr, true); err != nil {
+		r, err := p.updatePolr(polr, oldObj)
+		if err != nil {
 			klog.ErrorS(err, "failed to update resource")
 		}
-		if err := p.broadcaster.Action(watch.Added, updatedObject); err != nil {
+		if err := p.broadcaster.Action(watch.Modified, r); err != nil {
 			klog.ErrorS(err, "failed to broadcast event")
 		}
 		return updatedObject, true, nil
 	}
 
-	oldObj, err := p.getPolr(name, namespace)
-	if err != nil {
-		return nil, false, err
-	}
-
-	updatedObject, err := objInfo.UpdatedObject(ctx, oldObj)
-	if err != nil {
-		return nil, false, err
-	}
 	err = updateValidation(ctx, updatedObject, oldObj)
 	if err != nil {
 		switch options.FieldValidation {
@@ -191,13 +216,15 @@ func (p *polrStore) Update(ctx context.Context, name string, objInfo rest.Update
 		polr.Namespace = namespace
 	}
 
+	polr.Annotations = labelReports(polr.Annotations)
+	polr.Generation += 1
 	klog.Infof("updating policy reports name=%s namespace=%s", polr.Name, polr.Namespace)
 	if !isDryRun {
-		err := p.updatePolr(polr, false)
+		r, err := p.updatePolr(polr, oldObj)
 		if err != nil {
 			return nil, false, errors.NewBadRequest(fmt.Sprintf("cannot create policy report: %s", err.Error()))
 		}
-		if err := p.broadcaster.Action(watch.Modified, updatedObject); err != nil {
+		if err := p.broadcaster.Action(watch.Modified, r); err != nil {
 			klog.ErrorS(err, "failed to broadcast event")
 		}
 	}
@@ -212,7 +239,7 @@ func (p *polrStore) Delete(ctx context.Context, name string, deleteValidation re
 	polr, err := p.getPolr(name, namespace)
 	if err != nil {
 		klog.ErrorS(err, "Failed to find polrs", "name", name, "namespace", klog.KRef("", namespace))
-		return nil, false, errors.NewNotFound(v1alpha2.Resource("policyreports"), name)
+		return nil, false, errors.NewNotFound(utils.PolicyReportsGR, name)
 	}
 
 	err = deleteValidation(ctx, polr)
@@ -254,21 +281,47 @@ func (p *polrStore) DeleteCollection(ctx context.Context, deleteValidation rest.
 
 	if !isDryRun {
 		for _, polr := range polrList.Items {
-			obj, isDeleted, err := p.Delete(ctx, polr.GetName(), deleteValidation, options)
+			_, isDeleted, err := p.Delete(ctx, polr.GetName(), deleteValidation, options)
 			if !isDeleted {
 				klog.ErrorS(err, "Failed to delete polr", "name", polr.GetName(), "namespace", klog.KRef("", namespace))
 				return nil, errors.NewBadRequest(fmt.Sprintf("Failed to delete policy report: %s/%s", polr.Namespace, polr.GetName()))
-			}
-			if err := p.broadcaster.Action(watch.Deleted, obj); err != nil {
-				klog.ErrorS(err, "failed to broadcast event")
 			}
 		}
 	}
 	return polrList, nil
 }
 
-func (p *polrStore) Watch(ctx context.Context, _ *metainternalversion.ListOptions) (watch.Interface, error) {
-	return p.broadcaster.Watch()
+func (p *polrStore) Watch(ctx context.Context, options *metainternalversion.ListOptions) (watch.Interface, error) {
+	switch options.ResourceVersion {
+	case "", "0":
+		return p.broadcaster.Watch()
+	default:
+		break
+	}
+	items, err := p.List(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	list, ok := items.(*v1alpha2.PolicyReportList)
+	if !ok {
+		return nil, fmt.Errorf("failed to convert runtime object into policy report list")
+	}
+	events := make([]watch.Event, len(list.Items))
+	for i, pol := range list.Items {
+		report := pol.DeepCopy()
+		if report.Generation == 1 || report.Generation == 0 {
+			events[i] = watch.Event{
+				Type:   watch.Added,
+				Object: report,
+			}
+		} else {
+			events[i] = watch.Event{
+				Type:   watch.Modified,
+				Object: report,
+			}
+		}
+	}
+	return p.broadcaster.WatchWithPrefix(events)
 }
 
 func (p *polrStore) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1beta1.Table, error) {
@@ -325,31 +378,17 @@ func (p *polrStore) listPolr(namespace string) (*v1alpha2.PolicyReportList, erro
 	return reportList, nil
 }
 
-func (p *polrStore) createPolr(report *v1alpha2.PolicyReport) error {
-	report.ResourceVersion = fmt.Sprint(1)
+func (p *polrStore) createPolr(report *v1alpha2.PolicyReport) (*v1alpha2.PolicyReport, error) {
+	report.ResourceVersion = p.store.UseResourceVersion()
 	report.UID = uuid.NewUUID()
 	report.CreationTimestamp = metav1.Now()
 
-	return p.store.PolicyReports().Create(context.TODO(), *report)
+	return report, p.store.PolicyReports().Create(context.TODO(), *report)
 }
 
-func (p *polrStore) updatePolr(report *v1alpha2.PolicyReport, force bool) error {
-	if !force {
-		oldReport, err := p.getPolr(report.GetName(), report.Namespace)
-		if err != nil {
-			return errorpkg.Wrapf(err, "old policy report not found")
-		}
-		oldRV, err := strconv.ParseInt(oldReport.ResourceVersion, 10, 64)
-		if err != nil {
-			return errorpkg.Wrapf(err, "could not parse resource version")
-		}
-
-		report.ResourceVersion = fmt.Sprint(oldRV + 1)
-	} else {
-		report.ResourceVersion = "1"
-	}
-
-	return p.store.PolicyReports().Update(context.TODO(), *report)
+func (p *polrStore) updatePolr(report *v1alpha2.PolicyReport, _ *v1alpha2.PolicyReport) (*v1alpha2.PolicyReport, error) {
+	report.ResourceVersion = p.store.UseResourceVersion()
+	return report, p.store.PolicyReports().Update(context.TODO(), *report)
 }
 
 func (p *polrStore) deletePolr(report *v1alpha2.PolicyReport) error {
