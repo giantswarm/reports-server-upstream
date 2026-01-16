@@ -3,12 +3,13 @@ package opts
 import (
 	"fmt"
 	"net"
+	"os"
+	"strconv"
 	"strings"
 
 	"github.com/kyverno/reports-server/pkg/api"
 	generatedopenapi "github.com/kyverno/reports-server/pkg/api/generated/openapi"
-	"github.com/kyverno/reports-server/pkg/server"
-	"github.com/kyverno/reports-server/pkg/storage/db"
+	"github.com/kyverno/reports-server/pkg/storage/etcd"
 	openapinamer "k8s.io/apiserver/pkg/endpoints/openapi"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
@@ -30,11 +31,15 @@ type Options struct {
 	Features       *genericoptions.FeatureOptions
 	Logging        *logs.Options
 
-	ShowVersion bool
-	Debug       bool
-	Kubeconfig  string
+	ShowVersion   bool
+	SkipMigration bool
+	Etcd          bool
+	Kubeconfig    string
+	ClusterName   string
 
 	// dbopts
+	EtcdConfig    etcd.EtcdConfig
+	EtcdDir       string
 	DBHost        string
 	DBPort        int
 	DBUser        string
@@ -44,6 +49,13 @@ type Options struct {
 	DBSSLRootCert string
 	DBSSLKey      string
 	DBSSLCert     string
+
+	// apiservice install config
+	ServiceName           string
+	ServiceNamespace      string
+	StoreReports          bool
+	StoreEphemeralReports bool
+	StoreOpenreports      bool
 
 	// Only to be used to for testing
 	DisableAuthForTesting bool
@@ -65,18 +77,22 @@ func (o *Options) validate() []error {
 
 func (o *Options) Flags() (fs flag.NamedFlagSets) {
 	msfs := fs.FlagSet("policy server")
-	msfs.BoolVar(&o.Debug, "debug", false, "Use inmemory database for debugging")
+	msfs.StringVar(&o.ClusterName, "clustername", "", "Optional name for cluster database records")
+	msfs.BoolVar(&o.Etcd, "etcd", false, "Use embedded etcd database")
+	msfs.StringVar(&o.EtcdConfig.Endpoints, "etcdEndpoints", "", "Enpoints used for connect to etcd server")
+	msfs.BoolVar(&o.EtcdConfig.Insecure, "etcdSkipTLS", true, "Skip TLS verification when connecting to etcd")
 	msfs.BoolVar(&o.ShowVersion, "version", false, "Show version")
 	msfs.StringVar(&o.Kubeconfig, "kubeconfig", o.Kubeconfig, "The path to the kubeconfig used to connect to the Kubernetes API server and the Kubelets (defaults to in-cluster config)")
-	msfs.StringVar(&o.DBHost, "dbhost", "reportsdb.kyverno", "Host url of postgres instance")
-	msfs.IntVar(&o.DBPort, "dbport", 5432, "Port of the postgres instance")
-	msfs.StringVar(&o.DBUser, "dbuser", "postgres", "Username to login into postgres")
-	msfs.StringVar(&o.DBPassword, "dbpassword", "password", "Password to login into postgres")
-	msfs.StringVar(&o.DBName, "dbname", "reportsdb", "Name of the database to store policy reports in")
 	msfs.StringVar(&o.DBSSLMode, "dbsslmode", "disable", "SSL mode of the postgres database.")
 	msfs.StringVar(&o.DBSSLRootCert, "dbsslrootcert", "", "Path to database root cert.")
 	msfs.StringVar(&o.DBSSLKey, "dbsslkey", "", "Path to database ssl key.")
 	msfs.StringVar(&o.DBSSLCert, "dbsslcert", "", "Path to database ssl cert.")
+	msfs.StringVar(&o.ServiceName, "servicename", "", "Name of the service targeted by the APIService.")
+	msfs.StringVar(&o.ServiceNamespace, "servicens", "", "Namespace of the service targeted by the APIService.")
+	msfs.BoolVar(&o.StoreReports, "storereports", true, "Whether or not to store and manage Policy Reports.")
+	msfs.BoolVar(&o.StoreOpenreports, "storeopenreports", true, "Whether or not to store and manage Open Reports.")
+	msfs.BoolVar(&o.StoreEphemeralReports, "storeephemeralreports", true, "Whether or not to store and manage Ephemeral Reports.")
+	msfs.BoolVar(&o.SkipMigration, "skipmigration", false, "Skip database migration on startup.")
 
 	o.SecureServing.AddFlags(fs.FlagSet("apiserver secure serving"))
 	o.Authentication.AddFlags(fs.FlagSet("apiserver authentication"))
@@ -98,36 +114,6 @@ func NewOptions() *Options {
 		Audit:          genericoptions.NewAuditOptions(),
 		Logging:        logs.NewOptions(),
 	}
-}
-
-func (o Options) ServerConfig() (*server.Config, error) {
-	apiserver, err := o.ApiserverConfig()
-	if err != nil {
-		return nil, err
-	}
-	restConfig, err := o.restConfig()
-	if err != nil {
-		return nil, err
-	}
-
-	dbconfig := &db.PostgresConfig{
-		Host:        o.DBHost,
-		Port:        o.DBPort,
-		User:        o.DBUser,
-		Password:    o.DBPassword,
-		DBname:      o.DBName,
-		SSLMode:     o.DBSSLMode,
-		SSLRootCert: o.DBSSLRootCert,
-		SSLKey:      o.DBSSLKey,
-		SSLCert:     o.DBSSLCert,
-	}
-
-	return &server.Config{
-		Apiserver: apiserver,
-		Rest:      restConfig,
-		Debug:     o.Debug,
-		DBconfig:  dbconfig,
-	}, nil
 }
 
 func (o Options) ApiserverConfig() (*genericapiserver.Config, error) {
@@ -166,7 +152,7 @@ func (o Options) ApiserverConfig() (*genericapiserver.Config, error) {
 	return serverConfig, nil
 }
 
-func (o Options) restConfig() (*rest.Config, error) {
+func (o Options) RestConfig() (*rest.Config, error) {
 	var config *rest.Config
 	var err error
 	if len(o.Kubeconfig) > 0 {
@@ -189,4 +175,21 @@ func (o Options) restConfig() (*rest.Config, error) {
 		return nil, err
 	}
 	return config, nil
+}
+
+// dbConfig reads the database configuration directly from environment variables
+// because these configurations contain sensitive data, this is not read directly from command line input,
+// to enable usecases of env variable injection, such as using vault-env
+func (o *Options) DBConfig() error {
+	o.DBHost = os.Getenv("DB_HOST")
+	o.DBName = os.Getenv("DB_DATABASE")
+	o.DBUser = os.Getenv("DB_USER")
+	o.DBPassword = os.Getenv("DB_PASSWORD")
+	dbPort, err := strconv.Atoi(os.Getenv("DB_PORT"))
+	if err != nil {
+		return err
+	} else {
+		o.DBPort = dbPort
+	}
+	return nil
 }

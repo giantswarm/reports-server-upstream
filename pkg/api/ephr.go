@@ -54,14 +54,10 @@ func (p *ephrStore) NewList() runtime.Object {
 
 func (p *ephrStore) List(ctx context.Context, options *metainternalversion.ListOptions) (runtime.Object, error) {
 	var labelSelector labels.Selector
-	// fieldSelector := fields.Everything() // TODO: Field selectors
 	if options != nil {
 		if options.LabelSelector != nil {
 			labelSelector = options.LabelSelector
 		}
-		// if options.FieldSelector != nil {
-		// 	fieldSelector = options.FieldSelector
-		// }
 	}
 	namespace := genericapirequest.NamespaceValue(ctx)
 
@@ -70,10 +66,6 @@ func (p *ephrStore) List(ctx context.Context, options *metainternalversion.ListO
 	if err != nil {
 		return nil, errors.NewBadRequest("failed to list resource ephemeralreport")
 	}
-
-	// if labelSelector == labels.Everything() {
-	// 	return list, nil
-	// }
 
 	ephrList := &reportsv1.EphemeralReportList{
 		Items:    make([]reportsv1.EphemeralReport, 0),
@@ -103,6 +95,7 @@ func (p *ephrStore) List(ctx context.Context, options *metainternalversion.ListO
 		}
 	}
 	ephrList.ListMeta.ResourceVersion = strconv.FormatUint(resourceVersion, 10)
+	klog.Infof("filtered list found length: %d", len(ephrList.Items))
 	return ephrList, nil
 }
 
@@ -125,10 +118,6 @@ func (p *ephrStore) Create(ctx context.Context, obj runtime.Object, createValida
 		switch options.FieldValidation {
 		case "Ignore":
 		case "Warn":
-			// return &admissionv1.AdmissionResponse{
-			// 	Allowed:  false,
-			// 	Warnings: []string{err.Error()},
-			// }, nil
 		case "Strict":
 			return nil, err
 		}
@@ -157,7 +146,7 @@ func (p *ephrStore) Create(ctx context.Context, obj runtime.Object, createValida
 	if !isDryRun {
 		r, err := p.createEphr(ephr)
 		if err != nil {
-			return nil, errors.NewBadRequest(fmt.Sprintf("cannot create ephemeral report: %s", err.Error()))
+			return nil, errors.NewAlreadyExists(utils.EphemeralReportsGR, ephr.Name)
 		}
 		if err := p.broadcaster.Action(watch.Added, r); err != nil {
 			klog.ErrorS(err, "failed to broadcast event")
@@ -198,10 +187,6 @@ func (p *ephrStore) Update(ctx context.Context, name string, objInfo rest.Update
 		switch options.FieldValidation {
 		case "Ignore":
 		case "Warn":
-			// return &admissionv1.AdmissionResponse{
-			// 	Allowed:  false,
-			// 	Warnings: []string{err.Error()},
-			// }, nil
 		case "Strict":
 			return nil, false, err
 		}
@@ -260,7 +245,7 @@ func (p *ephrStore) Delete(ctx context.Context, name string, deleteValidation re
 		}
 	}
 
-	return ephr, true, nil // TODO: Add protobuf
+	return ephr, true, nil
 }
 
 func (p *ephrStore) DeleteCollection(ctx context.Context, deleteValidation rest.ValidateObjectFunc, options *metav1.DeleteOptions, listOptions *metainternalversion.ListOptions) (runtime.Object, error) {
@@ -292,6 +277,7 @@ func (p *ephrStore) DeleteCollection(ctx context.Context, deleteValidation rest.
 }
 
 func (p *ephrStore) Watch(ctx context.Context, options *metainternalversion.ListOptions) (watch.Interface, error) {
+	klog.Infof("watching ephemeral reports rv=%s", options.ResourceVersion)
 	switch options.ResourceVersion {
 	case "", "0":
 		return p.broadcaster.Watch()
@@ -309,16 +295,9 @@ func (p *ephrStore) Watch(ctx context.Context, options *metainternalversion.List
 	events := make([]watch.Event, len(list.Items))
 	for i, pol := range list.Items {
 		report := pol.DeepCopy()
-		if report.Generation == 1 || report.Generation == 0 {
-			events[i] = watch.Event{
-				Type:   watch.Added,
-				Object: report,
-			}
-		} else {
-			events[i] = watch.Event{
-				Type:   watch.Modified,
-				Object: report,
-			}
+		events[i] = watch.Event{
+			Type:   watch.Added,
+			Object: report,
 		}
 	}
 	return p.broadcaster.WatchWithPrefix(events)
@@ -361,7 +340,7 @@ func (p *ephrStore) getEphr(name, namespace string) (*reportsv1.EphemeralReport,
 		return nil, errorpkg.Wrapf(err, "could not find ephemeral report in store")
 	}
 
-	return val.DeepCopy(), nil
+	return val, nil
 }
 
 func (p *ephrStore) listEphr(namespace string) (*reportsv1.EphemeralReportList, error) {
@@ -371,7 +350,11 @@ func (p *ephrStore) listEphr(namespace string) (*reportsv1.EphemeralReportList, 
 	}
 
 	reportList := &reportsv1.EphemeralReportList{
-		Items: valList,
+		Items: make([]reportsv1.EphemeralReport, 0, len(valList)),
+	}
+
+	for _, v := range valList {
+		reportList.Items = append(reportList.Items, *v.DeepCopy())
 	}
 
 	klog.Infof("value found of length:%d", len(reportList.Items))
@@ -383,12 +366,12 @@ func (p *ephrStore) createEphr(report *reportsv1.EphemeralReport) (*reportsv1.Ep
 	report.UID = uuid.NewUUID()
 	report.CreationTimestamp = metav1.Now()
 
-	return report, p.store.EphemeralReports().Create(context.TODO(), *report)
+	return report, p.store.EphemeralReports().Create(context.TODO(), report)
 }
 
 func (p *ephrStore) updateEphr(report *reportsv1.EphemeralReport, _ *reportsv1.EphemeralReport) (*reportsv1.EphemeralReport, error) {
 	report.ResourceVersion = p.store.UseResourceVersion()
-	return report, p.store.EphemeralReports().Update(context.TODO(), *report)
+	return report, p.store.EphemeralReports().Update(context.TODO(), report)
 }
 
 func (p *ephrStore) deleteEphr(report *reportsv1.EphemeralReport) error {

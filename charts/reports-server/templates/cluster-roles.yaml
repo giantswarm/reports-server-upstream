@@ -23,6 +23,31 @@ rules:
     - watch
     - deletecollection
 - apiGroups:
+    - ""
+  resources:
+    - namespaces
+  verbs:
+    - get
+- apiGroups:
+    - apiregistration.k8s.io
+  resources:
+    - apiservices
+  verbs:
+    - create
+- apiGroups:
+    - apiregistration.k8s.io
+  resources:
+    - apiservices
+  verbs:
+    - get
+    - delete
+    - update
+    - patch
+  resourceNames:
+    - v1.reports.kyverno.io
+    - v1alpha2.wgpolicyk8s.io
+    - v1alpha1.openreports.io
+- apiGroups:
     - wgpolicyk8s.io
   resources:
     - policyreports

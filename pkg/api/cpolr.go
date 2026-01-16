@@ -53,24 +53,16 @@ func (c *cpolrStore) NewList() runtime.Object {
 
 func (c *cpolrStore) List(ctx context.Context, options *metainternalversion.ListOptions) (runtime.Object, error) {
 	var labelSelector labels.Selector
-	// fieldSelector := fields.Everything() // TODO: Field selectors
 	if options != nil {
 		if options.LabelSelector != nil {
 			labelSelector = options.LabelSelector
 		}
-		// if options.FieldSelector != nil {
-		// 	fieldSelector = options.FieldSelector
-		// }
 	}
 	klog.Infof("listing all cluster policy reports")
 	list, err := c.listCpolr()
 	if err != nil {
 		return nil, errors.NewBadRequest("failed to list resource clusterpolicyreport")
 	}
-
-	// if labelSelector.String() == labels.Everything().String() {
-	// 	return list, nil
-	// }
 
 	cpolrList := &v1alpha2.ClusterPolicyReportList{
 		Items:    make([]v1alpha2.ClusterPolicyReport, 0),
@@ -100,6 +92,7 @@ func (c *cpolrStore) List(ctx context.Context, options *metainternalversion.List
 		}
 	}
 	cpolrList.ListMeta.ResourceVersion = strconv.FormatUint(resourceVersion, 10)
+	klog.Infof("filtered list found length: %d", len(cpolrList.Items))
 	return cpolrList, nil
 }
 
@@ -120,10 +113,6 @@ func (c *cpolrStore) Create(ctx context.Context, obj runtime.Object, createValid
 		switch options.FieldValidation {
 		case "Ignore":
 		case "Warn":
-			// return &admissionv1.AdmissionResponse{
-			// 	Allowed:  false,
-			// 	Warnings: []string{err.Error()},
-			// }, nil
 		case "Strict":
 			return nil, err
 		}
@@ -135,7 +124,7 @@ func (c *cpolrStore) Create(ctx context.Context, obj runtime.Object, createValid
 	}
 	if cpolr.Name == "" {
 		if cpolr.GenerateName == "" {
-			return nil, errors.NewConflict(utils.ClusterPolicyReportsGR, cpolr.Name, fmt.Errorf("name and generate name not provided"))
+			return nil, errors.NewAlreadyExists(utils.ClusterPolicyReportsGR, cpolr.Name)
 		}
 		cpolr.Name = nameGenerator.GenerateName(cpolr.GenerateName)
 	}
@@ -185,10 +174,6 @@ func (c *cpolrStore) Update(ctx context.Context, name string, objInfo rest.Updat
 		switch options.FieldValidation {
 		case "Ignore":
 		case "Warn":
-			// return &admissionv1.AdmissionResponse{
-			// 	Allowed:  false,
-			// 	Warnings: []string{err.Error()},
-			// }, nil
 		case "Strict":
 			return nil, false, err
 		}
@@ -240,7 +225,7 @@ func (c *cpolrStore) Delete(ctx context.Context, name string, deleteValidation r
 		}
 	}
 
-	return cpolr, true, nil // TODO: Add protobuf in wgpolicygroup
+	return cpolr, true, nil
 }
 
 func (c *cpolrStore) DeleteCollection(ctx context.Context, deleteValidation rest.ValidateObjectFunc, options *metav1.DeleteOptions, listOptions *metainternalversion.ListOptions) (runtime.Object, error) {
@@ -271,6 +256,7 @@ func (c *cpolrStore) DeleteCollection(ctx context.Context, deleteValidation rest
 }
 
 func (c *cpolrStore) Watch(ctx context.Context, options *metainternalversion.ListOptions) (watch.Interface, error) {
+	klog.Infof("watching cluster policy reports rv=%s", options.ResourceVersion)
 	switch options.ResourceVersion {
 	case "", "0":
 		return c.broadcaster.Watch()
@@ -288,16 +274,9 @@ func (c *cpolrStore) Watch(ctx context.Context, options *metainternalversion.Lis
 	events := make([]watch.Event, len(list.Items))
 	for i, pol := range list.Items {
 		report := pol.DeepCopy()
-		if report.Generation == 1 || report.Generation == 0 {
-			events[i] = watch.Event{
-				Type:   watch.Added,
-				Object: report,
-			}
-		} else {
-			events[i] = watch.Event{
-				Type:   watch.Modified,
-				Object: report,
-			}
+		events[i] = watch.Event{
+			Type:   watch.Added,
+			Object: report,
 		}
 	}
 	return c.broadcaster.WatchWithPrefix(events)
@@ -340,7 +319,7 @@ func (c *cpolrStore) getCpolr(name string) (*v1alpha2.ClusterPolicyReport, error
 		return nil, errorpkg.Wrapf(err, "could not find cluster policy report in store")
 	}
 
-	return val.DeepCopy(), nil
+	return val, nil
 }
 
 func (c *cpolrStore) listCpolr() (*v1alpha2.ClusterPolicyReportList, error) {
@@ -350,7 +329,11 @@ func (c *cpolrStore) listCpolr() (*v1alpha2.ClusterPolicyReportList, error) {
 	}
 
 	reportList := &v1alpha2.ClusterPolicyReportList{
-		Items: valList,
+		Items: make([]v1alpha2.ClusterPolicyReport, 0, len(valList)),
+	}
+
+	for _, v := range valList {
+		reportList.Items = append(reportList.Items, *v.DeepCopy())
 	}
 
 	klog.Infof("value found of length:%d", len(reportList.Items))
@@ -362,12 +345,12 @@ func (c *cpolrStore) createCpolr(report *v1alpha2.ClusterPolicyReport) (*v1alpha
 	report.UID = uuid.NewUUID()
 	report.CreationTimestamp = metav1.Now()
 
-	return report, c.store.ClusterPolicyReports().Create(context.TODO(), *report)
+	return report, c.store.ClusterPolicyReports().Create(context.TODO(), report)
 }
 
 func (c *cpolrStore) updateCpolr(report *v1alpha2.ClusterPolicyReport, _ *v1alpha2.ClusterPolicyReport) (*v1alpha2.ClusterPolicyReport, error) {
 	report.ResourceVersion = c.store.UseResourceVersion()
-	return report, c.store.ClusterPolicyReports().Update(context.TODO(), *report)
+	return report, c.store.ClusterPolicyReports().Update(context.TODO(), report)
 }
 
 func (c *cpolrStore) deleteCpolr(report *v1alpha2.ClusterPolicyReport) error {

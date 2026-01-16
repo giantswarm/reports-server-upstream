@@ -22,7 +22,7 @@ REGISTER_GEN                       := $(TOOLS_DIR)/register-gen
 OPENAPI_GEN                        := $(TOOLS_DIR)/openapi-gen
 CODE_GEN_VERSION                   := v0.28.0
 KIND                               := $(TOOLS_DIR)/kind
-KIND_VERSION                       := v0.23.0
+KIND_VERSION                       := v0.30.0
 KO                                 := $(TOOLS_DIR)/ko
 KO_VERSION                         := v0.14.1
 HELM                               := $(TOOLS_DIR)/helm
@@ -142,6 +142,7 @@ codegen-openapi: $(PACKAGE_SHIM) $(OPENAPI_GEN) ## Generate openapi
 		-i k8s.io/apimachinery/pkg/runtime \
 		-i k8s.io/apimachinery/pkg/types \
 		-i k8s.io/api/core/v1 \
+		-i openreports.io/apis/openreports.io/v1alpha1 \
 		-i sigs.k8s.io/wg-policy-prototypes/policy-report/pkg/api/wgpolicyk8s.io/v1alpha2 \
 		-i github.com/kyverno/kyverno/api/reports/v1 \
 		-i github.com/kyverno/kyverno/api/policyreport/v1alpha2 \
@@ -158,27 +159,29 @@ codegen-helm-docs: ## Generate helm docs
 codegen-install-manifest: $(HELM) ## Create install manifest
 	@echo Generate latest install manifest... >&2
 	@$(HELM) template reports-server --namespace reports-server ./charts/reports-server/ \
+		--set apiServicesManagement.installApiServices.enabled=true \
 		--set image.tag=latest \
 		--set templating.enabled=true \
  		| $(SED) -e '/^#.*/d' \
 		> ./config/install.yaml
 
-codegen-install-manifest-inmemory: $(HELM) ## Create install manifest without postgres
+codegen-install-manifest-etcd: $(HELM) ## Create install manifest without postgres
 	@echo Generate latest install manifest... >&2
 	@$(HELM) template reports-server --namespace reports-server ./charts/reports-server/ \
+		--set apiServicesManagement.installApiServices.enabled=true \
 		--set image.tag=latest \
-		--set config.debug=true \
+		--set config.etcd.enabled=true \
 		--set postgresql.enabled=false \
 		--set templating.enabled=true \
  		| $(SED) -e '/^#.*/d' \
-		> ./config/install-inmemory.yaml
+		> ./config/install-etcd.yaml
 
 .PHONY: codegen
 codegen: ## Rebuild all generated code and docs
 codegen: codegen-helm-docs
 codegen: codegen-openapi
 codegen: codegen-install-manifest
-codegen: codegen-install-manifest-inmemory
+codegen: codegen-install-manifest-etcd
 
 .PHONY: verify-codegen
 verify-codegen: codegen ## Verify all generated code and docs are up to date
@@ -192,7 +195,7 @@ verify-codegen: codegen ## Verify all generated code and docs are up to date
 # KIND #
 ########
 
-KIND_IMAGE     ?= kindest/node:v1.30.0
+KIND_IMAGE     ?= kindest/node:v1.33.4
 KIND_NAME      ?= kind
 
 .PHONY: kind-create
@@ -206,9 +209,13 @@ kind-delete: $(KIND) ## Delete kind cluster
 	@$(KIND) delete cluster --name $(KIND_NAME)
 
 .PHONY: kind-load
-kind-load: $(KIND) ko-build ## Build image and load in kind cluster
+kind-load: $(KIND) ko-build docker-save-image ## Build image and load in kind cluster
 	@echo Load image... >&2
-	@$(KIND) load docker-image --name $(KIND_NAME) $(KO_REGISTRY)/$(PACKAGE):$(GIT_SHA)
+		@$(KIND) load image-archive reports-server.tar --name $(KIND_NAME)
+
+.PHONY: docker-save-image
+docker-save-image: $(KIND) ko-build ## Save docker images in archive
+	docker save $(KO_REGISTRY)/$(PACKAGE):$(GIT_SHA) > reports-server.tar
 
 .PHONY: kind-install
 kind-install: $(HELM) kind-load ## Build image, load it in kind cluster and deploy helm chart
@@ -218,16 +225,16 @@ kind-install: $(HELM) kind-load ## Build image, load it in kind cluster and depl
 		--set image.repository=$(PACKAGE) \
 		--set image.tag=$(GIT_SHA)
 
-.PHONY: kind-install-inmemory
-kind-install-inmemory: $(HELM) kind-load ## Build image, load it in kind cluster and deploy helm chart
+.PHONY: kind-install-etcd
+kind-install-etcd: $(HELM) kind-load ## Build image, load it in kind cluster and deploy helm chart
 	@echo Install chart... >&2
 	@$(HELM) upgrade --install reports-server --namespace reports-server --create-namespace --wait ./charts/reports-server \
 		--set image.registry=$(KO_REGISTRY) \
-		--set config.debug=true \
+		--set config.etcd.enabled=true \
 		--set postgresql.enabled=false \
 		--set image.repository=$(PACKAGE) \
 		--set image.tag=$(GIT_SHA)
- 
+
 .PHONY: kind-apply
 kind-apply: $(HELM) kind-load ## Build image, load it in kind cluster and deploy helm chart
 	@echo Install chart... >&2
@@ -236,6 +243,33 @@ kind-apply: $(HELM) kind-load ## Build image, load it in kind cluster and deploy
 		--set image.repository=$(PACKAGE) \
 		--set image.tag=$(GIT_SHA) \
 			| kubectl apply -f -
+
+.PHONY: kind-migrate
+kind-migrate: $(HELM) kind-load ## Build image, load it in kind cluster and deploy helm chart
+	@echo Install chart... >&2
+	@$(HELM) upgrade --install reports-server --namespace reports-server --create-namespace --wait ./charts/reports-server \
+		--set image.registry=$(KO_REGISTRY) \
+		--set image.repository=$(PACKAGE) \
+		--set image.tag=$(GIT_SHA) \
+		--set apiServicesManagement.installApiServices.enabled=false
+
+.PHONY: kind-apply-api-services
+kind-apply-api-services: $(HELM) kind-load ## Build image, load it in kind cluster and deploy helm chart
+	@echo Install api services... >&2
+	@$(HELM) template reports-server --namespace reports-server ./charts/reports-server \
+		--set image.registry=$(KO_REGISTRY) \
+		--set image.repository=$(PACKAGE) \
+		--set image.tag=$(GIT_SHA) \
+			| kubectl apply -f -
+
+.PHONY: install-pss-policies
+install-pss-policies: $(HELM)
+	@echo Install pss policies... >&2
+	@$(HELM) repo add kyverno https://kyverno.github.io/kyverno/
+	@$(HELM) upgrade --install kyverno-policies kyverno/kyverno-policies \
+		--set=podSecurityStandard=restricted \
+		--set=background=true \
+		--set=validationFailureAction=Audit
 
 ########
 # HELP #

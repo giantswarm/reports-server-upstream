@@ -54,14 +54,10 @@ func (p *polrStore) NewList() runtime.Object {
 
 func (p *polrStore) List(ctx context.Context, options *metainternalversion.ListOptions) (runtime.Object, error) {
 	var labelSelector labels.Selector
-	// fieldSelector := fields.Everything() // TODO: Field selectors
 	if options != nil {
 		if options.LabelSelector != nil {
 			labelSelector = options.LabelSelector
 		}
-		// if options.FieldSelector != nil {
-		// 	fieldSelector = options.FieldSelector
-		// }
 	}
 	namespace := genericapirequest.NamespaceValue(ctx)
 
@@ -70,10 +66,6 @@ func (p *polrStore) List(ctx context.Context, options *metainternalversion.ListO
 	if err != nil {
 		return nil, errors.NewBadRequest("failed to list resource policyreport")
 	}
-
-	// if labelSelector == labels.Everything() {
-	// 	return list, nil
-	// }
 
 	polrList := &v1alpha2.PolicyReportList{
 		Items:    make([]v1alpha2.PolicyReport, 0),
@@ -103,6 +95,7 @@ func (p *polrStore) List(ctx context.Context, options *metainternalversion.ListO
 		}
 	}
 	polrList.ListMeta.ResourceVersion = strconv.FormatUint(resourceVersion, 10)
+	klog.Infof("filtered list found length: %d", len(polrList.Items))
 	return polrList, nil
 }
 
@@ -125,10 +118,6 @@ func (p *polrStore) Create(ctx context.Context, obj runtime.Object, createValida
 		switch options.FieldValidation {
 		case "Ignore":
 		case "Warn":
-			// return &admissionv1.AdmissionResponse{
-			// 	Allowed:  false,
-			// 	Warnings: []string{err.Error()},
-			// }, nil
 		case "Strict":
 			return nil, err
 		}
@@ -157,7 +146,7 @@ func (p *polrStore) Create(ctx context.Context, obj runtime.Object, createValida
 	if !isDryRun {
 		r, err := p.createPolr(polr)
 		if err != nil {
-			return nil, errors.NewBadRequest(fmt.Sprintf("cannot create policy report: %s", err.Error()))
+			return nil, errors.NewAlreadyExists(utils.PolicyReportsGR, polr.Name)
 		}
 		if err := p.broadcaster.Action(watch.Added, r); err != nil {
 			klog.ErrorS(err, "failed to broadcast event")
@@ -198,10 +187,6 @@ func (p *polrStore) Update(ctx context.Context, name string, objInfo rest.Update
 		switch options.FieldValidation {
 		case "Ignore":
 		case "Warn":
-			// return &admissionv1.AdmissionResponse{
-			// 	Allowed:  false,
-			// 	Warnings: []string{err.Error()},
-			// }, nil
 		case "Strict":
 			return nil, false, err
 		}
@@ -260,7 +245,7 @@ func (p *polrStore) Delete(ctx context.Context, name string, deleteValidation re
 		}
 	}
 
-	return polr, true, nil // TODO: Add protobuf in wgpolicygroup
+	return polr, true, nil
 }
 
 func (p *polrStore) DeleteCollection(ctx context.Context, deleteValidation rest.ValidateObjectFunc, options *metav1.DeleteOptions, listOptions *metainternalversion.ListOptions) (runtime.Object, error) {
@@ -292,6 +277,7 @@ func (p *polrStore) DeleteCollection(ctx context.Context, deleteValidation rest.
 }
 
 func (p *polrStore) Watch(ctx context.Context, options *metainternalversion.ListOptions) (watch.Interface, error) {
+	klog.Infof("watching policy reports rv=%s", options.ResourceVersion)
 	switch options.ResourceVersion {
 	case "", "0":
 		return p.broadcaster.Watch()
@@ -309,16 +295,9 @@ func (p *polrStore) Watch(ctx context.Context, options *metainternalversion.List
 	events := make([]watch.Event, len(list.Items))
 	for i, pol := range list.Items {
 		report := pol.DeepCopy()
-		if report.Generation == 1 || report.Generation == 0 {
-			events[i] = watch.Event{
-				Type:   watch.Added,
-				Object: report,
-			}
-		} else {
-			events[i] = watch.Event{
-				Type:   watch.Modified,
-				Object: report,
-			}
+		events[i] = watch.Event{
+			Type:   watch.Added,
+			Object: report,
 		}
 	}
 	return p.broadcaster.WatchWithPrefix(events)
@@ -361,7 +340,7 @@ func (p *polrStore) getPolr(name, namespace string) (*v1alpha2.PolicyReport, err
 		return nil, errorpkg.Wrapf(err, "could not find policy report in store")
 	}
 
-	return val.DeepCopy(), nil
+	return val, nil
 }
 
 func (p *polrStore) listPolr(namespace string) (*v1alpha2.PolicyReportList, error) {
@@ -371,7 +350,11 @@ func (p *polrStore) listPolr(namespace string) (*v1alpha2.PolicyReportList, erro
 	}
 
 	reportList := &v1alpha2.PolicyReportList{
-		Items: valList,
+		Items: make([]v1alpha2.PolicyReport, 0, len(valList)),
+	}
+
+	for _, v := range valList {
+		reportList.Items = append(reportList.Items, *v.DeepCopy())
 	}
 
 	klog.Infof("value found of length:%d", len(reportList.Items))
@@ -383,12 +366,12 @@ func (p *polrStore) createPolr(report *v1alpha2.PolicyReport) (*v1alpha2.PolicyR
 	report.UID = uuid.NewUUID()
 	report.CreationTimestamp = metav1.Now()
 
-	return report, p.store.PolicyReports().Create(context.TODO(), *report)
+	return report, p.store.PolicyReports().Create(context.TODO(), report)
 }
 
 func (p *polrStore) updatePolr(report *v1alpha2.PolicyReport, _ *v1alpha2.PolicyReport) (*v1alpha2.PolicyReport, error) {
 	report.ResourceVersion = p.store.UseResourceVersion()
-	return report, p.store.PolicyReports().Update(context.TODO(), *report)
+	return report, p.store.PolicyReports().Update(context.TODO(), report)
 }
 
 func (p *polrStore) deletePolr(report *v1alpha2.PolicyReport) error {
